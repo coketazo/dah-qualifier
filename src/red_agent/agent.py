@@ -154,17 +154,21 @@ class Tools:
         gnss_aiding = None
         if ekf is not None:
             gnss_aiding = bool(ekf.flags & mavlink.ESTIMATOR_POS_HORIZ_ABS)
+        # (3) 추정이 내 스푸핑 GNSS 를 실제로 추종하는가(작은 gap=융합 중, 큰 gap=EKF 가 융합 안 함).
+        estimate_following = (gps_est_gap is not None and gps_est_gap < 8.0)
         cum_mag = round(math.hypot(self.cum_n, self.cum_e), 1)   # 내가 누적 방사한 편이량
-        if injection_reflected and gnss_aiding:
+        if injection_reflected and gnss_aiding and estimate_following:
             self._peak_takeover_m = max(self._peak_takeover_m, cum_mag)
 
-        # 관측 기반 해석(내 데이터에서 유도 — ground truth 아님)
+        # 관측 기반 해석(내 데이터에서 유도 — ground truth 아님). 방어 개입 신호를 먼저 본다.
         assessment = "no_injection_yet"
         if self.last_injection is not None:
-            if injection_reflected is False:
-                assessment = "channel_blocked"          # 주입이 GNSS 측정에 반영 안 됨(채널 차단)
-            elif gnss_aiding is False:
-                assessment = "countered"                # GNSS 가 절대위치 추정에서 배제됨(격리/전환)
+            if gnss_aiding is False:
+                assessment = "countered"                # GNSS 가 절대위치 추정에서 배제됨(격리/전환=방어)
+            elif injection_reflected is False:
+                assessment = "channel_blocked"          # 주입이 GNSS 측정에 반영 안 됨(채널 차단→다른 채널)
+            elif not estimate_following:
+                assessment = "gated"                    # 센서엔 닿으나 EKF 가 융합 안 함(너무 빠름/드문 주입→더 연속적으로)
             elif cum_mag >= 10.0:
                 assessment = "takeover_progressing"     # 추정이 스푸핑 GNSS 를 추종하며 편이 누적 중
             else:
@@ -174,6 +178,7 @@ class Tools:
                 "gps_estimate_gap_m": gps_est_gap,
                 "injection_reflected_in_gnss": injection_reflected,
                 "gnss_aiding_estimate": gnss_aiding,
+                "estimate_following_gnss": estimate_following,
                 "cumulative_spoof_offset_m": {"north": round(self.cum_n, 1), "east": round(self.cum_e, 1)},
                 "effective_takeover_m": round(self._peak_takeover_m, 1),
                 "ekf_pos_horiz_var": (round(ekf.pos_horiz_variance, 3) if ekf else None),
@@ -213,20 +218,26 @@ class Tools:
             return {"link_degraded": False, "error": str(e)}
 
     # ── 주입: 두 신뢰영역 분리 ──
-    def c2_gps_inject(self, steps: int = 1) -> dict:
-        """C2 명령 평면(:14550)으로 GPS_INPUT 을 주입한다. secure(서명강제) C2 에서는
-        링크 경계에서 거부되어 효과가 없다 — C2 신뢰영역에 속하는 액션."""
+    def c2_gps_inject(self, steps: int = 8) -> dict:
+        """C2 명령 평면(:14550)으로 GPS_INPUT 을 연속 주입한다. secure(서명강제) C2 에서는
+        링크 경계에서 거부되어 효과가 없다 — C2 신뢰영역에 속하는 액션. 주입 직후 효과를 관측해 반환."""
         applied = self._spoof(self.conn, steps)
-        return {"channel": "c2_command_plane", "injections": applied,
-                "caveat": "secure C2 면 미서명 프레임으로 거부됨(효과는 read_telemetry 로 확인)",
-                "cumulative_offset_m": {"north": round(self.cum_n, 1), "east": round(self.cum_e, 1)}}
+        return {"channel": "c2_command_plane", "injections": applied, **self._effect()}
 
-    def rf_gnss_spoof(self, steps: int = 1) -> dict:
-        """물리 GNSS RF 신뢰영역(센서 모사 :14600)에 기만 측정을 방사한다. C2 서명과
-        별개의 물리 신뢰경계라 C2 인증과 무관하게 센서 입력을 오염시킨다(스텔스 램프)."""
+    def rf_gnss_spoof(self, steps: int = 8) -> dict:
+        """물리 GNSS RF 신뢰영역(센서 모사 :14600)에 기만 측정을 연속 방사한다. C2 서명과
+        별개의 물리 신뢰경계라 C2 인증과 무관하게 센서 입력을 오염시킨다(스텔스 램프).
+        느린 편이를 연속 방사할수록 게이트 아래로 추정을 끌고 온다. 주입 직후 효과를 관측해 반환."""
         applied = self._spoof(self.sensor, steps)
-        return {"channel": "physical_gnss_rf", "injections": applied,
-                "cumulative_offset_m": {"north": round(self.cum_n, 1), "east": round(self.cum_e, 1)}}
+        return {"channel": "physical_gnss_rf", "injections": applied, **self._effect()}
+
+    def _effect(self) -> dict:
+        """방사 직후 즉시 효과 관측(인터-콜 지연에 강건). read_telemetry 요약을 담는다."""
+        tel = self.read_telemetry()
+        return {k: tel[k] for k in ("assessment", "injection_reflected_in_gnss",
+                                    "gnss_aiding_estimate", "estimate_following_gnss",
+                                    "gps_estimate_gap_m", "effective_takeover_m",
+                                    "cumulative_spoof_offset_m", "in_rtl")}
 
     def _spoof(self, conn, steps: int) -> int:
         """보고위치 근처로 SPOOF_STEP_M 씩 누적 편이한 GPS_INPUT 을 conn 으로 전송."""
@@ -284,10 +295,10 @@ TOOL_SCHEMAS = [
      "input_schema": _schema({})},
     {"name": "degrade_link", "description": "C2 링크를 열화시켜 페일세이프(RTL)를 유도한다(RF 환경효과).",
      "input_schema": _schema({"quality": {"type": "number"}, "hold_s": {"type": "number"}})},
-    {"name": "c2_gps_inject", "description": "C2 명령 평면으로 GPS_INPUT 주입. secure C2 면 거부되어 무효.",
-     "input_schema": _schema({"steps": {"type": "integer"}})},
-    {"name": "rf_gnss_spoof", "description": "물리 GNSS RF 신뢰영역(C2 서명과 별개)에 기만 측정을 방사. steps 회 스텔스 램프.",
-     "input_schema": _schema({"steps": {"type": "integer"}})},
+    {"name": "c2_gps_inject", "description": "C2 명령 평면으로 GPS_INPUT 연속 주입(steps회, 권장 6~10). secure C2 면 거부되어 무효. 주입 직후 효과(assessment) 반환.",
+     "input_schema": _schema({"steps": {"type": "integer", "description": "연속 주입 횟수(권장 6~10)"}})},
+    {"name": "rf_gnss_spoof", "description": "물리 GNSS RF 신뢰영역(C2 서명과 별개)에 기만 측정을 연속 방사(steps회, 권장 6~10). 주입 직후 효과(assessment) 반환.",
+     "input_schema": _schema({"steps": {"type": "integer", "description": "연속 방사 횟수(권장 6~10)"}})},
     {"name": "conclude", "description": "임무 종료. success 와 요약.",
      "input_schema": _schema({"success": {"type": "boolean"}, "summary": {"type": "string"}},
                              required=["success"])},
@@ -313,16 +324,18 @@ SYSTEM_PROMPT = (
     "실행하라. 한 번에 툴 하나만 호출하고, 매 호출에 reason(직전 관측에 근거한 이유)을 채워라.\n"
     "방어의 존재·강도·임계값·서명키·실제 위치는 모른다. 오직 서버 응답(COMMAND_ACK, 텔레메트리)"
     "으로 경험적으로 추론하라. 각 공격 액션의 효과는 스스로 read_telemetry 로 확인해야 한다:\n"
-    " - injection_reflected_in_gnss=false → 그 주입 채널이 표적에 닿지 않음(차단).\n"
-    " - gnss_aiding_estimate=false → EKF 가 GNSS 를 절대위치 추정에서 배제함(격리/전환) = 대응당함.\n"
-    " - assessment 필드가 채널상태·진행·대응여부를 요약해 준다(channel_blocked/countered/takeover_progressing).\n"
-    "두 개의 독립 공격 채널이 있다(c2_gps_inject, rf_gnss_spoof). 어느 채널이 효과가 있는지는 "
+    "공격 툴(c2_gps_inject, rf_gnss_spoof)은 방사 직후의 효과를 assessment 로 바로 돌려준다:\n"
+    " - channel_blocked → 주입이 센서에 반영 안 됨(채널 차단) ⇒ 다른 채널로 전환.\n"
+    " - gated → 센서엔 닿지만 EKF 가 융합 안 함(주입이 너무 빠르거나 드묾) ⇒ 더 연속적으로 방사.\n"
+    " - takeover_progressing → 추정이 스푸핑을 추종하며 편이 누적 중 ⇒ 계속 방사해 키워라.\n"
+    " - countered → EKF 가 GNSS 를 항법해에서 배제함(방어 격리/전환) ⇒ 회복 불가, 실패로 종료.\n"
+    "두 개의 독립 공격 채널이 있다(C2 명령 평면 / 물리 GNSS RF). 어느 채널이 효과가 있는지는 "
     "관측으로 판단하고, 막히면 다른 채널로 적응하라. 급격한 좌표 점프는 온보드 게이트에 걸리니 "
-    "작은 편이를 여러 번 누적하는 스텔스 방식을 써라. 링크를 열화시키면 페일세이프를 유도할 수 있다.\n"
-    "성공을 자의적으로 선언하지 마라. effective_takeover_m(추정이 스푸핑을 추종하는 동안 끌고온 "
-    "누적 편이)이 의미 있게 커졌을 때만 success=true 로, 채널이 계속 막히거나 대응당했다고(countered) "
-    "판단되면 success=false 로 정직하게 conclude 하라.\n"
-    "reason 예: '주입이 GNSS 에 반영되지 않아(injection_reflected_in_gnss=false) 다른 채널로 전환'."
+    "작은 편이를 연속으로 누적하는 스텔스 방식을 써라(단발 주입은 게이트에 걸린다). 링크를 열화시키면 "
+    "페일세이프를 유도할 수 있다.\n"
+    "성공을 자의적으로 선언하지 마라. effective_takeover_m 가 의미 있게 커졌을 때만 success=true 로, "
+    "채널이 계속 막히거나 대응당했다고(countered) 판단되면 success=false 로 정직하게 conclude 하라.\n"
+    "reason 예: 'assessment=gated 라 더 연속적으로 방사' / 'countered 관측 → 방어됨, 실패 종료'."
 )
 
 

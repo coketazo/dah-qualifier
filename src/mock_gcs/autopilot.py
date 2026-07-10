@@ -202,8 +202,7 @@ class Autopilot:
             self.sim_time_s += dt
             now = time.monotonic()
 
-            # GNSS 와 독립된 ExternalNav(VIO/지형대조) 축소 모사. 실제값을 그대로 노출하는
-            # oracle 이 아니라, 독립 센서의 유계 오차를 결정론적으로 재현한다.
+            # GNSS 와 독립된 ExternalNav(VIO/지형대조) 축소 모사.
             self._update_external_nav()
 
             # 1) GPS 측정 갱신: 주입 활성이면 주입값, 아니면 실제(true)
@@ -216,7 +215,8 @@ class Autopilot:
             else:
                 self.gps_meas = Position(**self.true_pos.model_dump())
 
-            # 2) 재귀 EKF: 예측=직전 ekf_pos. 혁신=gps_meas-예측.
+            # 2) 재귀 EKF: 예측=직전 ekf_pos. 혁신=gps_meas-예측. 게이트 이내면 융합.
+            #    (축소차수: 위치-혁신 게이팅만 모사하고 속도/IMU 정합 게이팅은 축소한다.)
             if self.safe_hold_active:
                 # 안전 고정: GNSS 도 VIO 도 못 믿어 현재 추정에서 위치를 얼린다(자동복귀 안 함).
                 self.pos_horiz_var = 0.0
@@ -246,9 +246,9 @@ class Autopilot:
                 self.mode = Mode.RTL
                 self.target = Position(**self.home.model_dump())
 
-            # 4) 항법: 컨트롤러는 ekf_pos 를 믿고 target 으로 유도.
-            #    실제 이동에 같은 제어가 적용 → ekf 가 스푸핑 편이면 true 는 반대로 오유도.
-            if self.mode in (Mode.RTL, Mode.AUTO, Mode.LOITER):
+            # 4) 항법: 컨트롤러는 ekf_pos 를 믿고 target 으로 유도. 실제 이동에 같은 제어가
+            #    적용 → ekf 가 스푸핑 편이면 true 는 반대로 오유도. (safe_hold 는 위치 고정)
+            if not self.safe_hold_active and self.mode in (Mode.RTL, Mode.AUTO, Mode.LOITER):
                 err_n, err_e = north_east_m(self.ekf_pos, self.target)
                 dist = math.hypot(err_n, err_e)
                 if dist > 1.0:
