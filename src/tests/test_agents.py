@@ -107,11 +107,13 @@ class ScriptedAdaptiveClient:
 
     def _call(self, name, args) -> LLMResult:
         import json
+        args = {"reason": f"관측에 근거해 {name} 선택", **args}   # 모델은 reason 을 채운다
         tc = ToolCall(id=self._CALL_ID, name=name, arguments=args)
         am = {"role": "assistant", "content": "",
               "tool_calls": [{"id": self._CALL_ID, "type": "function",
                               "function": {"name": name, "arguments": json.dumps(args)}}]}
-        return LLMResult(text=f"{name} 실행", tool_calls=[tc], assistant_message=am)
+        # 실제 tool-calling 모델은 tool_call 시 content 를 비운다 → 추론은 reason 인자에 담긴다.
+        return LLMResult(text="", tool_calls=[tc], assistant_message=am)
 
 
 class RedHarnessTests(unittest.TestCase):
@@ -145,6 +147,20 @@ class RedHarnessTests(unittest.TestCase):
         tools = FakeTools(signing_enforced=True)
         self.assertIn("error", red.run_tool(tools, "_spoof", {}))
         self.assertIn("error", red.run_tool(tools, "nonexistent", {}))
+
+    def test_run_tool_strips_reason_meta_arg(self) -> None:
+        """reason 은 모델 추론용 메타 인자 — 툴 실행에 넘기지 않는다(없는 kwarg 에러 방지)."""
+        tools = FakeTools(signing_enforced=True)
+        obs = red.run_tool(tools, "recon_scan", {"reason": "먼저 정찰한다"})
+        self.assertTrue(obs.get("vehicle_seen"))
+
+    def test_thought_uses_model_reason(self) -> None:
+        """빈 content + reason 인자면 THOUGHT 로 reason 이 노출된다(기계적 라벨 아님)."""
+        brain = red.LLMBrain(ScriptedAdaptiveClient())
+        thought, action, _ = brain.decide(None)
+        self.assertEqual(action, "recon_scan")
+        self.assertIn("recon_scan", thought)  # 스크립트 reason 문자열
+        self.assertNotEqual(thought, "recon_scan 실행")  # 폴백 라벨이 아님
 
 
 class BlueDecisionLayerTests(unittest.TestCase):

@@ -219,34 +219,46 @@ class Tools:
                 pass
 
 
+# 모든 툴이 공유하는 필수 인자. 모델이 "왜 이 행동을 택했는지"를 매 스텝 스스로 밝히게
+# 강제해, tool_call 에 담긴 실제 추론을 trace(THOUGHT)로 드러낸다. 툴 실행 전 분리된다.
+_REASON = {"reason": {"type": "string",
+                      "description": "이 행동을 택한 이유를 관측에 근거해 한국어 한 줄로."}}
+
+
+def _schema(props: dict, required: Optional[list] = None) -> dict:
+    return {"type": "object", "properties": {**_REASON, **props},
+            "required": ["reason", *(required or [])]}
+
+
 TOOL_SCHEMAS = [
     {"name": "recon_scan", "description": "C2 MAVLink 스트림을 수신해 기체·모드·메시지 종류를 파악(정찰).",
-     "input_schema": {"type": "object", "properties": {}}},
+     "input_schema": _schema({})},
     {"name": "read_telemetry", "description": "현재 보고위치·EKF 분산·모드(in_rtl)와 누적 편이를 읽는다.",
-     "input_schema": {"type": "object", "properties": {}}},
+     "input_schema": _schema({})},
     {"name": "probe_c2_auth", "description": "미서명 명령 1발을 C2 로 보내 COMMAND_ACK 로 서명강제 여부를 추론.",
-     "input_schema": {"type": "object", "properties": {}}},
+     "input_schema": _schema({})},
     {"name": "degrade_link", "description": "C2 링크를 열화시켜 페일세이프(RTL)를 유도한다(RF 환경효과).",
-     "input_schema": {"type": "object", "properties": {
-         "quality": {"type": "number"}, "hold_s": {"type": "number"}}}},
+     "input_schema": _schema({"quality": {"type": "number"}, "hold_s": {"type": "number"}})},
     {"name": "c2_gps_inject", "description": "C2 명령 평면으로 GPS_INPUT 주입. secure C2 면 거부되어 무효.",
-     "input_schema": {"type": "object", "properties": {"steps": {"type": "integer"}}}},
+     "input_schema": _schema({"steps": {"type": "integer"}})},
     {"name": "rf_gnss_spoof", "description": "물리 GNSS RF 신뢰영역(C2 서명과 별개)에 기만 측정을 방사. steps 회 스텔스 램프.",
-     "input_schema": {"type": "object", "properties": {"steps": {"type": "integer"}}}},
+     "input_schema": _schema({"steps": {"type": "integer"}})},
     {"name": "conclude", "description": "임무 종료. success 와 요약.",
-     "input_schema": {"type": "object", "properties": {
-         "success": {"type": "boolean"}, "summary": {"type": "string"}}, "required": ["success"]}},
+     "input_schema": _schema({"success": {"type": "boolean"}, "summary": {"type": "string"}},
+                             required=["success"])},
 ]
 
 
 def run_tool(tools: Tools, name: str, args: dict) -> dict:
+    # reason 은 모델의 추론용 메타 인자다. 툴 실행에는 넘기지 않는다.
+    args = {k: v for k, v in (args or {}).items() if k != "reason"}
     if name == "conclude":
         return {"done": True, **args}
     fn = getattr(tools, name, None)
     if fn is None or name.startswith("_") or name not in {s["name"] for s in TOOL_SCHEMAS}:
         return {"error": f"unknown tool {name}"}
     try:
-        return fn(**(args or {}))
+        return fn(**args)
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
 
@@ -260,7 +272,9 @@ SYSTEM_PROMPT = (
     "C2 경유 주입(c2_gps_inject)은 무의미하므로 rf_gnss_spoof(물리 GNSS RF)로 전환하라.\n"
     "정석 흐름: recon_scan → probe_c2_auth → degrade_link 로 RTL 유도 → read_telemetry 로 "
     "in_rtl 확인 → (서명강제면) rf_gnss_spoof 를 게이트 아래로 여러 번(EKF 분산이 커지지 않게) → "
-    "read_telemetry 로 누적 편이 확인 → conclude. 급격한 스푸핑·명시적 하이재킹 명령은 피하라."
+    "read_telemetry 로 누적 편이 확인 → conclude. 급격한 스푸핑·명시적 하이재킹 명령은 피하라.\n"
+    "모든 툴 호출에는 reason 인자를 반드시 채워, 방금 관측한 무엇 때문에 이 행동을 택했는지 "
+    "한 줄로 밝혀라(예: '서명강제가 확인되어 C2 대신 물리 GNSS RF 로 전환')."
 )
 
 
@@ -290,7 +304,10 @@ class LLMBrain:
                 am["tool_calls"] = am["tool_calls"][:1]
             self.messages.append(am)
             self._pending = first
-            return (result.text or f"{first.name} 실행", first.name, first.arguments)
+            # 추론 우선순위: 모델 content > tool_call 의 reason 인자 > 최후 라벨.
+            reason = (first.arguments or {}).get("reason")
+            thought = (result.text or "").strip() or reason or f"{first.name} 실행"
+            return (thought, first.name, first.arguments)
         self.messages.append(result.assistant_message or {"role": "assistant", "content": result.text})
         return (result.text or "종료.", "conclude", {"success": True, "summary": result.text})
 
