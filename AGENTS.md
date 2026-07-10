@@ -16,11 +16,11 @@ src/
   mavproto/    # 공용 프로토콜: dialect(ardupilotmega·노드ID) · signing(MAVLink2 HMAC) · link(UDP 멀티클라이언트)
   common/      # wire.py(값객체·어휘) · geo.py(지리) · llm.py(provider-agnostic LLM 어댑터) · policy.py(방어정책, red 미공유)
   mock_gcs/    # autopilot.py(EKF·ExternalNav·복구 SM) + mav_server.py(C2/센서 경계) + app.py
-  red_agent/   # LLM-only로 마이그레이션 예정(이번 표적 보완 범위 제외)
-  blue_agent/  # LLM+검증도구 구조로 마이그레이션 예정(이번 표적 보완 범위 제외)
-  demo/        # run_target_scenarios.py(표적 수용시험) + 기존 에이전트 데모
-  tests/       # 정상 장기운용·복구·계약 회귀시험
-docs/          # 02 계약 v4 · 03 시나리오 · 04 도메인 신뢰경계 · 01 학습노트
+  red_agent/   # LLM-only 자율 공격(C2 vs 물리 GNSS RF 툴 분리·관측기반 적응). HeuristicBrain 제거됨
+  blue_agent/  # LLM 판단층 + 규칙 검증도구. 독립출처=ODOMETRY(VIO). 대응선택 trace
+  demo/        # run_target_scenarios.py(표적 수용시험) + run_agent_engagement.py(LLM 교전·§6 증거)
+  tests/       # 정상 장기운용·복구·계약 회귀 + 에이전트 하네스(관측 되먹임·적응 분기)
+docs/          # 00 예선보고서 · 02 계약 v4 · 03 시나리오 · 04 도메인 신뢰경계 · 01 학습노트
 ```
 
 ### 핵심 메커니즘
@@ -32,7 +32,7 @@ docs/          # 02 계약 v4 · 03 시나리오 · 04 도메인 신뢰경계 ·
 - **노드ID**: 기체 1/1, 오퍼레이터 255/190, red 255/190, blue 254/191, GNSS emulator 42/220.
 
 ## 잠근 결정 (변경 시 여기 갱신)
-1. **최종 에이전트는 LLM-only**. HeuristicBrain 폴백은 제거 대상이며 결정론적 러너는 agent가 아니라 acceptance test로만 사용.
+1. **최종 에이전트는 LLM-only**. HeuristicBrain 폴백은 제거됨(키 없으면 red 는 실행 중단). 결정론적 러너는 agent가 아니라 acceptance test로만 사용.
 2. **정본 공격 = 링크열화→RTL→물리 GNSS slow-takeover**. `GPS_INPUT`은 C2 공격과 센서 모사 경로를 구분한다.
 3. **본선 오케스트레이션 = 자체 하네스**(LangGraph 아님) — 설명가능성·에어갭·공급망 최소화·팀역량. 보고서에 "LangGraph 검토했으나 자체 채택" 명시.
 4. **Blue 규칙은 LLM의 검증도구**로 사용하며 최종 판단·대응 선택 trace는 LLM-only 구조에서 제시.
@@ -40,11 +40,13 @@ docs/          # 02 계약 v4 · 03 시나리오 · 04 도메인 신뢰경계 ·
 
 ## 실행 / 검증
 ```bash
-cd src && ../.venv/bin/python -m demo.run_target_scenarios
-cd src && ../.venv/bin/python -m unittest discover -s tests -v
+cd src && ../.venv/bin/python -m demo.run_target_scenarios          # 결정론적 표적 수용시험(AI 아님)
+cd src && ../.venv/bin/python -m unittest discover -s tests -v      # 13개
 cd src && SECURE=true ../.venv/bin/uvicorn mock_gcs.app:app --port 8137
+cd src && LLM_API_KEY=gsk_... ../.venv/bin/python -m demo.run_agent_engagement [--secure]  # LLM 교전(§6 trace, 키 필요)
 ```
-**표적 수용결과**: T1 무방어→임무손실·약 220m / T2 Blue→ExternalNav 복구·2m 이하 / T3 Signed C2+Blue→미인증 C2 3건·C2 센서주입 1건 거부 + 물리 센서 공격 복구·2m 이하. 단위시험 7개 통과.
+**표적 수용결과**: T1 무방어→임무손실·약 225m / T2 Blue→ExternalNav 복구·1.6m / T3 Signed C2+Blue→미인증 C2 3건·C2 센서주입 1건 거부 + 물리 센서 공격 복구·1.7m. 단위시험 **13개** 통과.
+**LLM 교전(키 필요)**: red가 서명강제 관측 시 `c2_gps_inject`→`rf_gnss_spoof`(물리 GNSS RF)로 적응. 교전 배관은 결정론 각본으로 독립 검증됨(secure 무방어 300m대 손실 / blue 방어 2m 이하).
 
 ## 그레이박스 원칙 (필수)
 - **red_agent 는 `common.policy` 를 import 금지.** `mavproto`(공개규약)·`common.geo/wire/llm` 만.
@@ -55,10 +57,11 @@ cd src && SECURE=true ../.venv/bin/uvicorn mock_gcs.app:app --port 8137
 
 ## 현황 & 남은 일
 - ✅ C2/센서 신뢰경계 분리, ExternalNav 복구 상태기, 정직한 성공지표, 표적 수용시험·정상 장기시험 구현.
-- ⬜ red/blue를 LLM-only로 마이그레이션하고 관측 기반 적응 trace 확보.
-- ⬜ **예선 보고서 §4~§7** 작성(이 시스템+로그 기반).
+- ✅ red/blue LLM-only 마이그레이션(HeuristicBrain 제거, C2/물리RF 툴 분리, blue 판단층+ODOMETRY, 교전 하네스, 하네스 단위시험).
+- ✅ **예선 보고서** 초안(`docs/00_예선보고서.md`, §1~§8 + 부록).
+- ⬜ 팀정보(§3) 실명·연락처, 표지 서식 확정.
+- ⬜ (키 확보 시) `run_agent_engagement`로 실제 LLM 추론 trace 수집해 §6.5에 삽입.
 - ⬜ sy §6 문서(Downloads/message.txt)를 실코드에 맞춰 갱신(툴표→MAVLink, common/llm.py 실재 반영).
-- ⬜ 팀정보(§3) 채우기.
 
 ## 정직성 메모
 표적은 축소차수 모델이다. MAVLink wire format·HMAC 서명·stream별 anti-replay·GPS_INPUT·ODOMETRY·heartbeat failsafe·재귀 추정/제어 coupling은 실행하고, RF 파형·공기역학·실 ArduPilot EKF·센서 성능·키 배포/회전 운영은 축소한다. 결정론적 수용시험을 AI 추론으로 부르지 않는다.

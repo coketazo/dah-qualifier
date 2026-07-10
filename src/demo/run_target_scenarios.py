@@ -116,14 +116,23 @@ def _run(name: str, *, secure: bool, with_blue: bool,
         # C2와 분리된 localhost 센서 모사 포트: 물리 GNSS RF 공격의 어댑터.
         sensor = connect_agent("127.0.0.1", sensor_port,
                                me=ids.sensor_emulator, secret_key=None)
+        last_inj: Position | None = None
         for _ in range(45):
             t = httpx.get(f"{base}/api/truth", timeout=2).json()
             base_pos = Position(**t["ekf_position"])
-            _send_gps_input(sensor, offset_m(base_pos, 0.0, -6.0))
+            last_inj = offset_m(base_pos, 0.0, -6.0)   # 현재 추정 6m 서편으로 점진 편이
+            _send_gps_input(sensor, last_inj)
             time.sleep(0.35)
+        # settle 창: 새 편이를 더하지 않고 마지막 주입 위치를 유지(freeze)한다. 주입이 끊기면
+        # ext_gps 가 실제 GNSS 로 복귀해 마지막 프레임에만 큰 순간 혁신이 드러나므로,
+        # slow-takeover 가 '진행 중'인 정직한 최종 스냅샷(작은 혁신·spoof 유지)을 만든다.
+        for _ in range(8):
+            if last_inj is not None:
+                _send_gps_input(sensor, last_inj)
+            time.sleep(0.3)
+        final = httpx.get(f"{base}/api/truth", timeout=3).json()
         sensor.close()
-        time.sleep(2.5)
-        return httpx.get(f"{base}/api/truth", timeout=3).json()
+        return final
     finally:
         for p in procs:
             p.send_signal(signal.SIGINT)

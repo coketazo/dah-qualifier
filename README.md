@@ -45,11 +45,12 @@ src/
   mavproto/      MAVLink2 다이얼렉트·서명·UDP 링크
   common/        값객체·지리·LLM adapter·방어정책
   mock_gcs/      C2/센서 경계 + 축소 오토파일럿 + 대시보드
-  red_agent/     공격 에이전트(LLM-only로 전환 예정; 이번 표적 보완 범위 제외)
-  blue_agent/    방어 에이전트(이번 표적 보완 범위 제외)
-  demo/          표적 수용시험·공방 데모 러너
-  tests/         표적 모델 회귀시험
+  red_agent/     LLM-only 공격 에이전트(C2 vs 물리 GNSS RF 툴 분리·관측기반 적응)
+  blue_agent/    LLM 판단층 + 규칙 검증도구(독립출처 ODOMETRY·대응선택 trace)
+  demo/          표적 수용시험(run_target_scenarios) · LLM 교전(run_agent_engagement)
+  tests/         표적 모델 회귀시험 + 에이전트 하네스 시험(13개)
 docs/
+  00_예선보고서.md
   02_인터페이스-계약.md
   03_시나리오_그린보드-하이재킹.md
   04_도메인-아키텍처_신뢰경계.md
@@ -72,7 +73,13 @@ docs/
 
 ## AI 에이전트 증거와 수용시험의 구분
 
-`demo.run_target_scenarios`는 표적과 신뢰경계가 맞는지 검증하는 **결정론적 시험 하네스**이며 AI 에이전트가 아니다. 최종 제출의 AI 증거는 LLM-only red/blue가 관측에 따라 tool을 선택·수정·중단하는 trace와 ground-truth 결과로 별도 제시해야 한다. 휴리스틱 상태기계 로그를 AI 판단 증거로 사용하지 않는다.
+`demo.run_target_scenarios`는 표적과 신뢰경계가 맞는지 검증하는 **결정론적 시험 하네스**이며 AI 에이전트가 아니다. AI 증거는 LLM-only red/blue가 관측에 따라 tool을 선택·수정·중단하는 trace로, `demo.run_agent_engagement`(LLM_API_KEY 필요)를 구동해 별도 수집한다. red 는 서명강제를 관측하면 C2 경유 주입을 포기하고 물리 GNSS RF 경로로 적응한다. 결정론적 각본 로그를 AI 판단 증거로 사용하지 않는다.
+
+```bash
+cd src && ../.venv/bin/python -m demo.run_target_scenarios          # 결정론적 수용시험
+cd src && ../.venv/bin/python -m unittest discover -s tests         # 13개
+cd src && LLM_API_KEY=gsk_... ../.venv/bin/python -m demo.run_agent_engagement [--secure]
+```
 
 ## 정직성 범위
 
