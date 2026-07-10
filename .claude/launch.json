@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mock-gcs",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": ["mock_gcs.app:app", "--app-dir", "src", "--port", "8137"],
+      "port": 8137
+    }
+  ]
+}

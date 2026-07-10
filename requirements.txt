@@ -1,0 +1,7 @@
+# DAH 2026 부가자료 의존성
+pydantic>=2.6
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+openai>=1.40             # LLM 브레인/트리아지 (Groq 등 OpenAI 호환 엔드포인트)
+pymavlink>=2.4.49        # 실물 MAVLink 2.0 규약·서명·GPS_INPUT (표적/에이전트 공용)
