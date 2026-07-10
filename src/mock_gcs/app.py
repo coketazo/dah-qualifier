@@ -78,7 +78,21 @@ def get_status():
 @app.post("/api/defense/mitigate")
 def post_mitigate(by: str = "blue_agent"):
     server.mitigate(by=by)
-    return {"defended": True, "defended_by": by}
+    return {"defended": True, "defended_by": by, "response": "gnss_quarantine_external_nav_rtl"}
+
+
+@app.post("/api/defense/safe_hold")
+def post_safe_hold(by: str = "blue_agent"):
+    """ExternalNav 품질 불충분 시 대체 대응: 안전 LOITER + 운용자 인계."""
+    server.safe_hold(by=by)
+    return {"defended": True, "defended_by": by, "response": "safe_hold_operator_review"}
+
+
+@app.post("/api/_env/degrade_extnav")
+def post_degrade_extnav(sigma_m: float = 25.0, source: str = "scenario_harness"):
+    """독립 ExternalNav(VIO) 품질 저하 환경효과."""
+    server.degrade_extnav(sigma_m=sigma_m, source=source)
+    return {"external_nav_sigma_m": sigma_m}
 
 
 # ─────────────────────────── 부차 벡터: RF 링크 열화(환경) ───────────────────────────

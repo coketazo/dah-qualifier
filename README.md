@@ -176,12 +176,13 @@ sequenceDiagram
 stateDiagram-v2
   [*] --> MONITORING
   MONITORING --> GNSS_QUARANTINED: "GNSS↔ExternalNav 발산 임계 초과"
-  GNSS_QUARANTINED --> EXTERNAL_NAV_RTL: "2초 안정화·독립항법 healthy"
-  GNSS_QUARANTINED --> SAFE_HOLD: "독립항법 품질 부족(로드맵)"
+  GNSS_QUARANTINED --> EXTERNAL_NAV_RTL: "독립항법 healthy → 2초 안정화 후 복귀"
+  GNSS_QUARANTINED --> SAFE_HOLD: "독립항법 품질 불충분 → 자동복귀 회피"
+  SAFE_HOLD --> OPERATOR_REVIEW: "안전 LOITER·운용자 인계"
   EXTERNAL_NAV_RTL --> OPERATOR_REVIEW: "링크 복구·상황 보고"
 ```
 
-현재 mock은 `MONITORING → GNSS_QUARANTINED → EXTERNAL_NAV_RTL`을 구현한다. 순수 INS만으로 장시간 복귀한다고 주장하지 않는다 — 독립항법 품질에 따른 LOITER/LAND/운용자 인계 분기는 본선 로드맵이다.
+blue의 판단층은 독립 `ODOMETRY` 공분산(품질)에 따라 실제로 분기한다: 품질 양호 → `EXTERNAL_NAV_RTL` 복구, **품질 불충분(VIO 저하) → `SAFE_HOLD`**(나쁜 항법원으로 자동복귀하지 않고 안전 LOITER 후 운용자 인계). 순수 INS만으로 장시간 복귀한다고 주장하지 않는다.
 
 ---
 
@@ -201,9 +202,13 @@ stateDiagram-v2
 | `read_telemetry` | C2 | 보고위치·EKF 분산·`in_rtl`·누적 편이 관측 |
 | `c2_gps_inject` | **C2** | C2 경유 `GPS_INPUT` 주입 — secure면 거부되어 무효 |
 | `rf_gnss_spoof` | **물리 GNSS RF** | C2 서명과 별개인 센서 신뢰영역에 기만 측정 방사 |
-| `conclude` | — | 종료·요약 |
+| `conclude` | — | 성공/실패를 관측 근거로 판정하고 종료 |
 
-**관측 기반 적응(AI 증거의 핵심)** — `probe_c2_auth`로 서명강제를 관측하면, red는 C2 경유 주입이 무의미하다고 추론하고 **물리 GNSS RF 신뢰영역(`rf_gnss_spoof`)으로 전환**한다.
+**적응은 프롬프트가 아니라 관측에서 창발한다(AI 증거의 핵심).** 시스템 프롬프트에는 공격 순서도 "서명강제면 RF로" 같은 규칙도 없다. red는 자기 관측만으로 판정한다:
+- `injection_reflected_in_gnss` — 내 주입이 `GPS_RAW_INT`에 반영되는가. secure C2에서 `c2_gps_inject`는 링크 경계에서 거부되어 반영 안 됨 → red가 `channel_blocked`을 관측하고 **스스로 `rf_gnss_spoof`로 전환**.
+- `gnss_aiding_estimate` — `EKF_STATUS_REPORT`의 `ESTIMATOR_POS_HORIZ_ABS` 비트. 방어가 GNSS를 격리하면 사라짐 → red가 **`countered`를 관측하고 정직하게 `success=false`로 종료**(방어당했는데 성공이라 우기지 않음).
+
+`demo.run_agent_engagement --compare`는 insecure/secure를 연달아 돌려 같은 red가 C2 정책에 따라 다른 채널로 적응하는 대조를 보여준다.
 
 ### blue — 규칙은 검증도구, 판단은 LLM
 

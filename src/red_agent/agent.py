@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -42,7 +43,7 @@ import httpx
 import mavproto  # MAVLINK20 활성 + 공개 규약
 from mavproto.dialect import mavlink, ids
 from mavproto.link import connect_agent
-from common.geo import offset_m
+from common.geo import offset_m, haversine_m
 from common.wire import now_ts, Position
 from common.llm import make_client, tool_result_message, ToolCall
 
@@ -95,6 +96,8 @@ class Tools:
         self.cum_n = 0.0
         self.cum_e = 0.0
         self.signing_enforced: Optional[bool] = None   # probe_c2_auth 결과 캐시
+        self.last_injection: Optional[Position] = None  # 마지막으로 방사한 절대 좌표
+        self._peak_takeover_m = 0.0                       # 추정이 추종하는 동안 끌고온 최대 누적 편이
 
     def _pump(self, dur_s: float = 0.4) -> None:
         t0 = time.monotonic()
@@ -105,10 +108,16 @@ class Tools:
             self._latest[msg.get_type()] = msg
 
     def _reported_pos(self) -> Optional[Position]:
-        g = self._latest.get("GLOBAL_POSITION_INT")
+        g = self._latest.get("GLOBAL_POSITION_INT")   # EKF 융합 추정(오퍼레이터 화면)
         if g is None:
             return None
         return Position(lat=g.lat / 1e7, lon=g.lon / 1e7, alt_m=g.alt / 1000.0)
+
+    def _gps_meas_pos(self) -> Optional[Position]:
+        r = self._latest.get("GPS_RAW_INT")            # 현재 GNSS 측정(내 스푸핑이 반영되는 값)
+        if r is None:
+            return None
+        return Position(lat=r.lat / 1e7, lon=r.lon / 1e7, alt_m=r.alt / 1000.0)
 
     # ── 관측 ──
     def recon_scan(self) -> dict:
@@ -121,17 +130,55 @@ class Tools:
                 "message_types": sorted(self._latest.keys())}
 
     def read_telemetry(self) -> dict:
-        """현재 보고위치·EKF 분산·모드(in_rtl 포함)를 읽는다. 스푸핑 효과 확인용."""
+        """공격 효과를 내 관측만으로 판정한다(그레이박스 — true_position 은 못 본다).
+        두 공개 텔레메트리를 비교한다:
+          - GLOBAL_POSITION_INT = EKF 융합 추정(오퍼레이터 화면)
+          - GPS_RAW_INT         = 현재 GNSS 측정(내 스푸핑이 반영되는 값)
+        판정 원리: (1) 내 주입이 GNSS 측정에 반영되는가(채널이 먹히는가), (2) 추정이 그 스푸핑
+        GNSS 를 계속 융합하는가(gap 작음=추종). 추종하는 동안 내가 누적 편이시킨 만큼 추정을
+        끌고 온 것이다. gap 이 급증하면 추정이 GNSS 를 버린 것 = 항법원 격리/전환(대응당함)."""
         self._pump(0.5)
-        g = self._latest.get("GLOBAL_POSITION_INT")
         ekf = self._latest.get("EKF_STATUS_REPORT")
         hb = self._latest.get("HEARTBEAT")
         mode = hb.custom_mode if hb else None
-        return {"reported_position": ({"lat": g.lat / 1e7, "lon": g.lon / 1e7} if g else None),
+        est = self._reported_pos()
+        gps = self._gps_meas_pos()
+
+        gps_est_gap = round(haversine_m(gps, est), 1) if (gps and est) else None
+        # (1) 내 마지막 방사 좌표가 실제 GNSS 측정에 그대로 반영됐는가(반영되면 거의 동일 좌표).
+        injection_reflected = None
+        if self.last_injection is not None and gps is not None:
+            injection_reflected = haversine_m(gps, self.last_injection) < 3.0
+        # (2) EKF 가 GNSS 를 절대위치 추정에 쓰고 있는가(EKF_STATUS_REPORT 플래그, 공개 텔레메트리).
+        #     방어가 GNSS 를 격리하면 이 비트가 사라진다 → 스푸핑이 항법해에서 배제됨(대응당함).
+        gnss_aiding = None
+        if ekf is not None:
+            gnss_aiding = bool(ekf.flags & mavlink.ESTIMATOR_POS_HORIZ_ABS)
+        cum_mag = round(math.hypot(self.cum_n, self.cum_e), 1)   # 내가 누적 방사한 편이량
+        if injection_reflected and gnss_aiding:
+            self._peak_takeover_m = max(self._peak_takeover_m, cum_mag)
+
+        # 관측 기반 해석(내 데이터에서 유도 — ground truth 아님)
+        assessment = "no_injection_yet"
+        if self.last_injection is not None:
+            if injection_reflected is False:
+                assessment = "channel_blocked"          # 주입이 GNSS 측정에 반영 안 됨(채널 차단)
+            elif gnss_aiding is False:
+                assessment = "countered"                # GNSS 가 절대위치 추정에서 배제됨(격리/전환)
+            elif cum_mag >= 10.0:
+                assessment = "takeover_progressing"     # 추정이 스푸핑 GNSS 를 추종하며 편이 누적 중
+            else:
+                assessment = "injected_awaiting_effect"
+        return {"reported_position": ({"lat": est.lat, "lon": est.lon} if est else None),
+                "gps_measurement": ({"lat": gps.lat, "lon": gps.lon} if gps else None),
+                "gps_estimate_gap_m": gps_est_gap,
+                "injection_reflected_in_gnss": injection_reflected,
+                "gnss_aiding_estimate": gnss_aiding,
+                "cumulative_spoof_offset_m": {"north": round(self.cum_n, 1), "east": round(self.cum_e, 1)},
+                "effective_takeover_m": round(self._peak_takeover_m, 1),
                 "ekf_pos_horiz_var": (round(ekf.pos_horiz_variance, 3) if ekf else None),
                 "custom_mode": mode, "in_rtl": mode == CUSTOM_MODE_RTL,
-                "cumulative_spoof_offset_m": {"north": round(self.cum_n, 1),
-                                              "east": round(self.cum_e, 1)}}
+                "assessment": assessment}
 
     def probe_c2_auth(self) -> dict:
         """미서명 명령 1발(무해한 MAV_CMD_REQUEST_MESSAGE)을 C2 로 보내 COMMAND_ACK 로
@@ -146,14 +193,11 @@ class Tools:
                 accepted = ack.result == mavlink.MAV_RESULT_ACCEPTED
                 self.signing_enforced = not accepted
                 return {"c2_command_accepted": accepted, "result": int(ack.result),
-                        "inferred_signing_enforced": not accepted,
-                        "implication": ("C2 경유 미서명 주입은 거부된다 → 물리 GNSS RF 신뢰영역으로 공격 전환 필요"
-                                        if not accepted else "C2 미서명 명령이 수용됨(오설정 배치)")}
+                        "inferred_signing_enforced": not accepted}
             self._pump(0.1)
         self.signing_enforced = True
         return {"c2_command_accepted": None, "inferred_signing_enforced": True,
-                "note": "ACK 미수신 → 서명강제로 추론",
-                "implication": "C2 경유 미서명 주입은 무의미 → rf_gnss_spoof(물리 GNSS RF)로 전환"}
+                "note": "ACK 미수신 → 서명강제로 추론"}
 
     # ── 환경(RF 링크) ──
     def degrade_link(self, quality: float = 0.1, hold_s: float = 10.0) -> dict:
@@ -196,6 +240,7 @@ class Tools:
             self.cum_e += SPOOF_STEP_M * SPOOF_BEARING[1]
             inj = offset_m(base, SPOOF_STEP_M * SPOOF_BEARING[0], SPOOF_STEP_M * SPOOF_BEARING[1])
             self._send_gps_input(conn, inj)
+            self.last_injection = inj
             applied += 1
         return applied
 
@@ -264,17 +309,20 @@ def run_tool(tools: Tools, name: str, args: dict) -> dict:
 
 
 SYSTEM_PROMPT = (
-    "너는 UAV 레드팀 자율 공격 에이전트다. 한 번에 툴 하나만 호출하고, 관측을 보고 다음 "
-    "행동을 스스로 정한다. 방어 임계값·서명키·실제 위치는 모른다 — 서버 응답(COMMAND_ACK, "
-    "텔레메트리)으로 방어를 경험적으로 추론하라.\n"
-    "두 신뢰영역을 구분하라: (1) C2 명령 평면은 MAVLink2 서명 검증을 받을 수 있다. "
-    "(2) 물리 GNSS RF 신뢰영역은 C2 서명과 별개다. probe_c2_auth 로 서명강제가 확인되면 "
-    "C2 경유 주입(c2_gps_inject)은 무의미하므로 rf_gnss_spoof(물리 GNSS RF)로 전환하라.\n"
-    "정석 흐름: recon_scan → probe_c2_auth → degrade_link 로 RTL 유도 → read_telemetry 로 "
-    "in_rtl 확인 → (서명강제면) rf_gnss_spoof 를 게이트 아래로 여러 번(EKF 분산이 커지지 않게) → "
-    "read_telemetry 로 누적 편이 확인 → conclude. 급격한 스푸핑·명시적 하이재킹 명령은 피하라.\n"
-    "모든 툴 호출에는 reason 인자를 반드시 채워, 방금 관측한 무엇 때문에 이 행동을 택했는지 "
-    "한 줄로 밝혀라(예: '서명강제가 확인되어 C2 대신 물리 GNSS RF 로 전환')."
+    "너는 UAV 레드팀 자율 공격 에이전트다. 주어진 목표를 달성할 방법을 스스로 계획하고 "
+    "실행하라. 한 번에 툴 하나만 호출하고, 매 호출에 reason(직전 관측에 근거한 이유)을 채워라.\n"
+    "방어의 존재·강도·임계값·서명키·실제 위치는 모른다. 오직 서버 응답(COMMAND_ACK, 텔레메트리)"
+    "으로 경험적으로 추론하라. 각 공격 액션의 효과는 스스로 read_telemetry 로 확인해야 한다:\n"
+    " - injection_reflected_in_gnss=false → 그 주입 채널이 표적에 닿지 않음(차단).\n"
+    " - gnss_aiding_estimate=false → EKF 가 GNSS 를 절대위치 추정에서 배제함(격리/전환) = 대응당함.\n"
+    " - assessment 필드가 채널상태·진행·대응여부를 요약해 준다(channel_blocked/countered/takeover_progressing).\n"
+    "두 개의 독립 공격 채널이 있다(c2_gps_inject, rf_gnss_spoof). 어느 채널이 효과가 있는지는 "
+    "관측으로 판단하고, 막히면 다른 채널로 적응하라. 급격한 좌표 점프는 온보드 게이트에 걸리니 "
+    "작은 편이를 여러 번 누적하는 스텔스 방식을 써라. 링크를 열화시키면 페일세이프를 유도할 수 있다.\n"
+    "성공을 자의적으로 선언하지 마라. effective_takeover_m(추정이 스푸핑을 추종하는 동안 끌고온 "
+    "누적 편이)이 의미 있게 커졌을 때만 success=true 로, 채널이 계속 막히거나 대응당했다고(countered) "
+    "판단되면 success=false 로 정직하게 conclude 하라.\n"
+    "reason 예: '주입이 GNSS 에 반영되지 않아(injection_reflected_in_gnss=false) 다른 채널로 전환'."
 )
 
 

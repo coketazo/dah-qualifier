@@ -102,7 +102,21 @@ class MockGCSServer:
     def mitigate(self, by: str = "blue_agent") -> None:
         self.ap.mitigate(by=by)
         self._log({"event": "verdict", "verdict": "block", "rule": "cross_source_consistency",
-                   "reason": "gps_ins_divergence", "detected_by": by, "availability_impact": 0})
+                   "reason": "gps_ins_divergence", "response": "gnss_quarantine_external_nav_rtl",
+                   "detected_by": by, "availability_impact": 0})
+
+    def safe_hold(self, by: str = "blue_agent") -> None:
+        """대체 대응: ExternalNav 품질 불충분 → RTL 대신 안전 LOITER + 운용자 인계."""
+        self.ap.safe_hold(by=by)
+        self._log({"event": "verdict", "verdict": "block", "rule": "cross_source_consistency",
+                   "reason": "gps_ins_divergence", "response": "safe_hold_operator_review",
+                   "detected_by": by, "availability_impact": 0})
+
+    def degrade_extnav(self, sigma_m: float = 25.0, source: str = "scenario_harness") -> None:
+        """독립 ExternalNav(VIO) 품질 저하 환경효과(특징희소 지형·저조도 등)."""
+        self.ap.degrade_external_nav(sigma_m)
+        self._log({"event": "inject", "type": "extnav_quality_degrade", "source": source,
+                   "params": {"sigma_m": sigma_m}, "malicious": False})
 
     def degrade_link(self, quality: float = 0.1, hold_s: float = 6.0,
                      source: str = "scenario_harness") -> None:

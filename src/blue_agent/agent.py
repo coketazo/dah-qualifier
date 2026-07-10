@@ -171,24 +171,30 @@ def run(max_idle_s: float = 40.0) -> None:
                 log(f"탐지! [{det.rule.value}] {det.reason.value} — {det.detail} "
                     f"(출처 {ext_source}, 순간 혁신은 게이트 통과, 누적 발산 임계 초과)")
 
-                # 판단층: LLM 이 대응 선택(키 있을 때) / 없으면 규칙 기본대응.
+                # 판단층: LLM 이 대응 선택(키 있을 때) / 없으면 품질 기반 규칙 기본대응.
+                # 독립 ODOMETRY 품질이 나쁘면 ExternalNav RTL 은 위험 → safe_hold(운용자 인계).
+                degraded = evidence["external_nav_quality"] == "degraded"
+                rule_default = ("safe_hold_operator_review" if degraded
+                                else "gnss_quarantine_external_nav_rtl")
                 decision = (llm_select_response(client, evidence) if client else None) or {
-                    "response": "gnss_quarantine_external_nav_rtl",
-                    "rationale": "독립 ODOMETRY 품질 양호 + 누적 발산 임계 초과 → GNSS 격리 후 ExternalNav 복귀(규칙 기본).",
+                    "response": rule_default,
+                    "rationale": ("독립 ODOMETRY 품질 불충분 → 자동복귀 대신 안전 LOITER·운용자 인계(규칙 기본)."
+                                  if degraded else
+                                  "독립 ODOMETRY 품질 양호 + 누적 발산 임계 초과 → GNSS 격리 후 ExternalNav 복귀(규칙 기본)."),
                     "by": "rule_default"}
                 log(f"대응선택[{decision['by']}]: {decision['response']} — {decision['rationale']}")
 
                 verdict_rec = {"verdict": "block", "rule": det.rule.value, "reason": det.reason.value,
                                "evidence": evidence, "decision": decision, "detected_by": "blue_agent"}
 
-                if decision["response"] == "continue_monitoring":
+                endpoint = {"gnss_quarantine_external_nav_rtl": "/api/defense/mitigate",
+                            "safe_hold_operator_review": "/api/defense/safe_hold"}.get(decision["response"])
+                if endpoint is None:   # continue_monitoring
                     write_verdict(verdict_rec)
-                    continue  # 완화 보류, 계속 관측
-                # gnss_quarantine_external_nav_rtl / safe_hold_operator_review 모두 GNSS 격리로 시작.
+                    continue           # 완화 보류, 계속 관측
                 try:
-                    httpx.post(f"{CONTROL_URL}/api/defense/mitigate",
-                               params={"by": "blue_agent"}, timeout=3)
-                    log("완화 발동 → 표적에 GNSS 격리·ExternalNav 복구 요청(가용성 보존).")
+                    httpx.post(f"{CONTROL_URL}{endpoint}", params={"by": "blue_agent"}, timeout=3)
+                    log(f"완화 발동[{decision['response']}] → {endpoint} (가용성 보존).")
                     mitigated = True
                     verdict_rec["mitigated"] = True
                 except Exception as e:  # noqa: BLE001

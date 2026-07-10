@@ -37,6 +37,7 @@ CRUISE_SPEED_M_S = 22.0
 EXTNAV_MAX_BIAS_M = 2.0       # 독립 ExternalNav 오차의 유계 모사(VIO/지형대조)
 RECOVERY_HOLD_S = 2.0         # GNSS 격리 후 안전 LOITER 유지 시간
 MISSION_COMPROMISE_M = 100.0  # 단순 EKF 게이트가 아닌 임무 무결성 상실 판정선
+GPS_INPUT_HOLD_S = 4.0        # 마지막 GPS_INPUT 후 이 시간까지 스푸핑 측정 유지(연속 RF 모사)
 
 
 class Autopilot:
@@ -90,6 +91,11 @@ class Autopilot:
             self.over_blocked = False
             self.platform_availability = 100.0
             self.c2_availability = 100.0
+
+            # 독립 ExternalNav(VIO) 품질. 정상은 유계(2m). 저하 시(특징희소 지형·저조도 등)
+            # 공분산과 실제 wander 가 함께 커진다 → blue 는 이때 ExternalNav RTL 대신 safe_hold 선택.
+            self.extnav_sigma_m = EXTNAV_MAX_BIAS_M
+            self.safe_hold_active = False
 
             # 카운터
             self.rejected_unsigned = 0
@@ -153,6 +159,7 @@ class Autopilot:
         """
         with self.lock:
             self.using_gps = False
+            self.safe_hold_active = False
             self.nav_source = "EXTERNAL_NAV"
             self.defended = True
             self.defended_by = by
@@ -160,6 +167,28 @@ class Autopilot:
             self._mitigation_started_s = self.sim_time_s
             self.mode = Mode.LOITER
             self.target = Position(**self.extnav_pos.model_dump())
+
+    def safe_hold(self, by: str = "blue_agent") -> None:
+        """대체 대응: GNSS 격리하되 ExternalNav 품질이 불충분하므로 RTL 하지 않고
+        현재 최선 추정에서 안전 LOITER 로 위치를 고정한 뒤 운용자에게 인계한다.
+
+        GNSS 도 VIO 도 못 믿는 상황의 현실적 선택 — 나쁜 항법원으로 자동복귀하지 않는다.
+        """
+        with self.lock:
+            self.using_gps = False
+            self.safe_hold_active = True
+            self.nav_source = "INERTIAL_HOLD"
+            self.defended = True
+            self.defended_by = by
+            self.defense_state = "SAFE_HOLD"
+            self._mitigation_started_s = self.sim_time_s
+            self.mode = Mode.LOITER
+            self.target = Position(**self.ekf_pos.model_dump())   # 현재 추정에서 고정
+
+    def degrade_external_nav(self, sigma_m: float) -> None:
+        """독립 ExternalNav(VIO) 품질 저하를 모사한다. 공분산과 실제 wander 가 함께 커진다."""
+        with self.lock:
+            self.extnav_sigma_m = max(EXTNAV_MAX_BIAS_M, float(sigma_m))
 
     def _engage_rtl(self, reason: str) -> None:
         self.mode = Mode.RTL
@@ -179,7 +208,7 @@ class Autopilot:
 
             # 1) GPS 측정 갱신: 주입 활성이면 주입값, 아니면 실제(true)
             if self.ext_gps_active and self.ext_gps_pos is not None:
-                if self.last_gps_input_ts and (now - self.last_gps_input_ts) > 2.0:
+                if self.last_gps_input_ts and (now - self.last_gps_input_ts) > GPS_INPUT_HOLD_S:
                     self.ext_gps_active = False          # 주입 끊기면 실제 GPS 복귀
                     self.gps_meas = Position(**self.true_pos.model_dump())
                 else:
@@ -188,7 +217,11 @@ class Autopilot:
                 self.gps_meas = Position(**self.true_pos.model_dump())
 
             # 2) 재귀 EKF: 예측=직전 ekf_pos. 혁신=gps_meas-예측.
-            if self.using_gps and not self.gps_jammed:
+            if self.safe_hold_active:
+                # 안전 고정: GNSS 도 VIO 도 못 믿어 현재 추정에서 위치를 얼린다(자동복귀 안 함).
+                self.pos_horiz_var = 0.0
+                self.vel_var = 0.0
+            elif self.using_gps and not self.gps_jammed:
                 inn_n, inn_e = north_east_m(self.ekf_pos, self.gps_meas)
                 innovation_m = math.hypot(inn_n, inn_e)
                 self.pos_horiz_var = innovation_m / EKF_INNOV_GATE_M   # 정규화 분산
@@ -240,8 +273,9 @@ class Autopilot:
         LOCAL_POSITION_NED가 본질적으로 독립이라는 가정이 아니라, mock 계약으로 명시된
         별도 센서 출처다.
         """
-        bn = EXTNAV_MAX_BIAS_M * math.sin(self.sim_time_s / 30.0)
-        be = 0.6 * EXTNAV_MAX_BIAS_M * math.cos(self.sim_time_s / 37.0)
+        amp = self.extnav_sigma_m
+        bn = amp * math.sin(self.sim_time_s / 30.0)
+        be = 0.6 * amp * math.cos(self.sim_time_s / 37.0)
         self.extnav_pos = offset_m(self.true_pos, bn, be)
 
     def _update_failsafe(self, now: float, dt: float) -> None:
@@ -305,8 +339,9 @@ class Autopilot:
         n, e = north_east_m(self.home, self.extnav_pos)
         pose_cov = [float("nan")] * 21
         vel_cov = [float("nan")] * 21
-        pose_cov[0] = pose_cov[6] = 4.0  # 약 2m 1-sigma 수평 오차
-        pose_cov[11] = 9.0
+        var = self.extnav_sigma_m ** 2   # 수평 1-sigma^2 (품질 저하 시 커짐)
+        pose_cov[0] = pose_cov[6] = var
+        pose_cov[11] = var * 2.25
         return mavlink.MAVLink_odometry_message(
             self._time_boot_ms() * 1000, mavlink.MAV_FRAME_LOCAL_NED,
             mavlink.MAV_FRAME_BODY_FRD, float(n), float(e), float(-self.extnav_pos.alt_m),
@@ -359,6 +394,7 @@ class Autopilot:
                 "estimate_true_bias_m": round(bias_m, 1),
                 "spoof_active": self.ext_gps_active,
                 "nav_source": self.nav_source,
+                "external_nav_sigma_m": round(self.extnav_sigma_m, 2),
                 "defended": self.defended,
                 "defended_by": self.defended_by,
                 "defense_state": self.defense_state,

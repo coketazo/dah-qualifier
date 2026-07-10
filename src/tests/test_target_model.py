@@ -45,6 +45,27 @@ class TargetModelTests(unittest.TestCase):
         self.assertEqual(messages["ODOMETRY"].estimator_type, 3)  # MAV_ESTIMATOR_TYPE_VIO
         self.assertEqual(messages["ODOMETRY"].quality, 90)
 
+    def test_safe_hold_does_not_rtl_on_degraded_external_nav(self) -> None:
+        """독립 ExternalNav 품질 불충분 시 대체 대응: RTL 하지 않고 안전 고정."""
+        ap = Autopilot()
+        ap.attack_observed = True
+        ap.degrade_external_nav(30.0)
+        ap.safe_hold("test")
+        for _ in range(15):
+            ap.step(0.2)
+        t = ap.truth()
+        self.assertEqual(t["defense_state"], "SAFE_HOLD")
+        self.assertEqual(t["nav_source"], "INERTIAL_HOLD")
+        self.assertEqual(t["mode"], "LOITER")          # 자동복귀(RTL) 하지 않음
+        self.assertEqual(t["external_nav_sigma_m"], 30.0)
+        self.assertFalse(t["mission_compromised"])
+
+    def test_degrade_external_nav_raises_odometry_covariance(self) -> None:
+        ap = Autopilot()
+        ap.degrade_external_nav(25.0)
+        odo = {m.get_type(): m for m in ap.telemetry_messages()}["ODOMETRY"]
+        self.assertAlmostEqual(odo.pose_covariance[0], 625.0)  # sigma^2 = 25^2
+
     def test_c2_reject_counters_distinguish_sensor_injection(self) -> None:
         ap = Autopilot()
         ap.record_c2_reject(sensor_message=False)
